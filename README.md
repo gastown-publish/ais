@@ -106,10 +106,36 @@ ais kill --all --save
 ### Credit rotation
 
 ```bash
-# Check remaining credits
+# Check remaining credits across all accounts
 ./scripts/check-credit.sh      # Claude
 ./scripts/check-kimi-credit.sh  # Kimi
 
+# Check specific accounts only
+./scripts/check-credit.sh cc1 cc3
+```
+
+<details>
+<summary><strong>Example output</strong></summary>
+
+```
+╔══════════════════════════════════════════════════════════════════════╗
+║  Claude Code Credit Check (GMT+7)                                  ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+┌──────────────┬──────────┬──────────┬───────────┬──────────────────────────┐
+│ Account      │ Week All │  Sonnet  │ Remaining │ Resets (GMT+7)           │
+├──────────────┼──────────┼──────────┼───────────┼──────────────────────────┤
+│ cc1          │    6%    │    0%    │   94% OK  │ Mar 06, 10:00am (GMT+7)  │
+│ cc2          │    1%    │    0%    │   99% OK  │ Mar 06, 12:00pm (GMT+7)  │
+│ cc3          │    2%    │    0%    │   98% OK  │ Mar 06, 11:00am (GMT+7)  │
+└──────────────┴──────────┴──────────┴───────────┴──────────────────────────┘
+
+  Best account: cc2 (99% remaining)
+```
+
+</details>
+
+```bash
 # Switch to a fresh account when one hits limits
 ais kill worker1
 ais create worker1 -a claude -A cc2 -d ~/app -c "continue from where cc1 left off"
@@ -266,6 +292,15 @@ bd close <id>     # Complete work
 See [`AGENTS.md`](AGENTS.md) for the agent collaboration workflow.
 
 ---
+
+## Prior Art
+
+This repo consolidates tools originally shared as standalone gists:
+
+- [Claude credit checker + agent setup](https://gist.github.com/thanakijwanavit/c0877d834e288de104b38f3f8cda233c) — `check-credit.sh`, `ais`, orchestrator skill, agent setup guide
+- [Kimi credit checker + multi-account](https://gist.github.com/thanakijwanavit/4d0e343bd8e0fbeefa8c0c7e03d13b91) — `check-kimi-credit.sh`, `kimi-account`, Kimi multi-account README
+
+This repo is the canonical, maintained version. The gists remain for reference.
 
 ## License
 
