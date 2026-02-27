@@ -12,8 +12,8 @@ set -uo pipefail
 CLAUDE_BIN=~/.npm/bin/claude
 ACCOUNTS_DIR=~/.claude-accounts
 TMUX_SESSION="credit-check-tmp"
-WAIT_LOAD=14        # seconds to wait for Claude to load
-WAIT_USAGE=8        # seconds to wait for /usage output
+WAIT_LOAD=22        # seconds to wait for Claude to load (includes MOTD, trust prompt, plugins)
+WAIT_USAGE=10       # seconds to wait for /usage output
 
 # If specific accounts passed as args, use those; otherwise check all
 if [ $# -gt 0 ]; then
@@ -103,35 +103,45 @@ check_account() {
   tmux new-session -d -s "$TMUX_SESSION" -x 160 -y 50
   tmux send-keys -t "$TMUX_SESSION" "CLAUDE_CONFIG_DIR=$config_dir $CLAUDE_BIN" Enter
 
-  # Wait for Claude to load
-  sleep "$WAIT_LOAD"
+  # Poll for Claude to be ready (prompt visible), handling trust/login screens
+  local screen ready=false
+  for _attempt in $(seq 1 30); do
+    sleep 2
+    screen=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -30 2>/dev/null || true)
 
-  # Check if we hit a login screen or bypass permissions prompt
-  local screen
-  screen=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -30 2>/dev/null || true)
+    # Check for login screen
+    if echo "$screen" | grep -qiE "Select login method|log in to use"; then
+      tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+      echo "AUTH|$acct|Not logged in|–|–|–"
+      return
+    fi
 
-  if echo "$screen" | grep -qiE "Select login method|log in"; then
+    # Check for trust/permissions prompt — accept it
+    if echo "$screen" | grep -qiE "Yes, I (accept|trust)"; then
+      tmux send-keys -t "$TMUX_SESSION" Enter
+      continue
+    fi
+
+    # Check if Claude prompt is ready (the ❯ prompt or "Try" suggestion)
+    if echo "$screen" | grep -qE '❯ $|Try "|esc to interrupt'; then
+      ready=true
+      break
+    fi
+  done
+
+  if [ "$ready" != true ]; then
     tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
-    echo "AUTH|$acct|Not logged in|–|–|–"
+    echo "TIMEOUT|$acct|Timed out waiting for prompt|–|–|–"
     return
   fi
 
-  # If bypass permissions prompt appears, accept it
-  if echo "$screen" | grep -qi "Yes, I accept"; then
-    tmux send-keys -t "$TMUX_SESSION" Down Enter
-    sleep 10
-    screen=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -30 2>/dev/null || true)
-    # If it exited back to shell, try without bypass
-    if echo "$screen" | grep -q '^\$\|^villa@'; then
-      tmux send-keys -t "$TMUX_SESSION" "CLAUDE_CONFIG_DIR=$config_dir $CLAUDE_BIN" Enter
-      sleep "$WAIT_LOAD"
-    fi
-  fi
-
-  # Send /usage command
-  tmux send-keys -t "$TMUX_SESSION" '/usage' Enter
+  # Type '/' to trigger the slash-command picker (use -l for literal)
+  tmux send-keys -t "$TMUX_SESSION" -l '/'
   sleep 2
-  # Press Enter to select from command picker
+  # Type 'usage' to filter the picker
+  tmux send-keys -t "$TMUX_SESSION" -l 'usage'
+  sleep 2
+  # Enter to select /usage from picker
   tmux send-keys -t "$TMUX_SESSION" Enter
   sleep "$WAIT_USAGE"
 
@@ -174,7 +184,11 @@ check_account() {
   sleep 2
   tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
 
-  echo "OK|$acct|$week_all|$week_sonnet|$((100 - week_all))|$reset_all_gmt7"
+  local remaining="?"
+  if [[ "$week_all" =~ ^[0-9]+$ ]]; then
+    remaining=$((100 - week_all))
+  fi
+  echo "OK|$acct|$week_all|$week_sonnet|$remaining|$reset_all_gmt7"
 }
 
 # ============================================================================
