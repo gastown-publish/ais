@@ -526,7 +526,8 @@ kill_one() {
   local name="$1" force="$2" save="$3"
 
   if [[ "$save" == true ]]; then
-    local logfile="${name}-$(date +%Y%m%d-%H%M%S).log"
+    local logfile
+    logfile="${name}-$(date +%Y%m%d-%H%M%S).log"
     tmux capture-pane -t "$name" -p -S - 2>/dev/null | sanitize_utf8 > "$logfile"
     info "saved scrollback to $logfile"
   fi
@@ -543,8 +544,8 @@ kill_one() {
   tmux send-keys -t "$name" Enter
 
   # Wait up to 10 seconds
-  local i
-  for i in $(seq 1 10); do
+  local _i
+  for _i in $(seq 1 10); do
     session_exists "$name" || { info "killed '$name' (graceful)"; return; }
     sleep 1
   done

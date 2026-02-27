@@ -85,7 +85,7 @@ cmd_add() {
   done
 
   mkdir -p "$ACCOUNTS_DIR/$n"
-  echo "$CONFIG_TEMPLATE" | sed "s|API_KEY_PLACEHOLDER|$key|g" > "$ACCOUNTS_DIR/$n/config.toml"
+  echo "${CONFIG_TEMPLATE//API_KEY_PLACEHOLDER/$key}" > "$ACCOUNTS_DIR/$n/config.toml"
   echo "  Added account $n (key: ...${key: -8})"
 }
 
@@ -186,7 +186,7 @@ cmd_setup() {
   done
 
   echo ""
-  echo "  Added $count accounts. Total: $(ls -d "$ACCOUNTS_DIR"/*/ 2>/dev/null | wc -l)"
+  echo "  Added $count accounts. Total: $(find "$ACCOUNTS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
 }
 
 # ── list: show all accounts ──
