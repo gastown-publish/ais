@@ -1,0 +1,329 @@
+#!/bin/bash
+# kimi-account — Run Kimi Code with any account by number
+#
+# Usage:
+#   kimi-account 1                    # run kimi with account 1
+#   kimi-account 3 --yolo             # run kimi account 3 in yolo mode
+#   kimi-account 2 -c "fix the bug"  # one-shot with account 2
+#   kimi-account add sk-kimi-xxxxx    # add a new account with API key
+#   kimi-account login                # add a new account via OAuth (browser)
+#   kimi-account login 3              # re-login account 3 via OAuth
+#   kimi-account list                 # list all accounts
+#   kimi-account check                # test all accounts
+#   kimi-account setup                # bulk-add keys from stdin
+
+set -uo pipefail
+
+ACCOUNTS_DIR=~/.kimi-accounts
+KIMI_BIN=~/.local/bin/kimi
+OPENCODE_BIN=~/.opencode/bin/opencode
+
+CONFIG_TEMPLATE='default_model = "kimi-code/kimi-for-coding"
+default_thinking = true
+default_yolo = false
+
+[models."kimi-code/kimi-for-coding"]
+provider = "kimi-api"
+model = "kimi-for-coding"
+max_context_size = 262144
+capabilities = ["thinking", "image_in", "video_in"]
+
+[providers.kimi-api]
+type = "kimi"
+base_url = "https://api.kimi.com/coding/v1"
+api_key = "API_KEY_PLACEHOLDER"
+
+[loop_control]
+max_steps_per_turn = 100
+max_retries_per_step = 3
+reserved_context_size = 50000
+
+[services.moonshot_search]
+base_url = "https://api.kimi.com/coding/v1/search"
+api_key = "API_KEY_PLACEHOLDER"
+
+[services.moonshot_fetch]
+base_url = "https://api.kimi.com/coding/v1/fetch"
+api_key = "API_KEY_PLACEHOLDER"
+
+[mcp.client]
+tool_call_timeout_ms = 60000'
+
+usage() {
+  echo "kimi-account — run Kimi Code with multiple accounts"
+  echo ""
+  echo "  kimi-account <number> [kimi args...]   Run kimi with account N"
+  echo "  kimi-account add <api-key>             Add account with API key"
+  echo "  kimi-account login [number]            Add/re-login account via OAuth"
+  echo "  kimi-account setup                     Bulk-add API keys (stdin)"
+  echo "  kimi-account list                      List all accounts"
+  echo "  kimi-account check                     Test all accounts"
+  echo "  kimi-account opencode <number>         Run opencode with account N"
+  echo ""
+  echo "Examples:"
+  echo "  kimi-account 1                         Interactive session"
+  echo "  kimi-account 3 --yolo                  Auto-approve mode"
+  echo "  kimi-account 2 -c 'fix the tests'      One-shot command"
+  echo "  kimi-account login                     Add new OAuth account (next number)"
+  echo "  kimi-account login 3                   Re-login account 3 via browser"
+  echo "  kimi-account opencode 1                Run opencode with account 1"
+  echo ""
+}
+
+# ── add: create account from API key ──
+cmd_add() {
+  local key="$1"
+  if [[ ! "$key" == sk-kimi-* ]] && [[ ! "$key" == sk-* ]]; then
+    echo "  Error: key should start with sk-kimi- or sk-"
+    return 1
+  fi
+
+  # Find next available number
+  local n=1
+  while [ -d "$ACCOUNTS_DIR/$n" ]; do
+    n=$((n + 1))
+  done
+
+  mkdir -p "$ACCOUNTS_DIR/$n"
+  echo "$CONFIG_TEMPLATE" | sed "s|API_KEY_PLACEHOLDER|$key|g" > "$ACCOUNTS_DIR/$n/config.toml"
+  echo "  Added account $n (key: ...${key: -8})"
+}
+
+# ── login: add/re-login via OAuth ──
+cmd_login() {
+  local n="${1:-}"
+
+  if [ -z "$n" ]; then
+    # Find next available number
+    n=1
+    while [ -d "$ACCOUNTS_DIR/$n" ]; do
+      n=$((n + 1))
+    done
+    echo "  Creating account $n (OAuth)..."
+  else
+    echo "  Logging in account $n (OAuth)..."
+  fi
+
+  mkdir -p "$ACCOUNTS_DIR/$n"
+
+  # Write OAuth config if no config exists yet
+  if [ ! -f "$ACCOUNTS_DIR/$n/config.toml" ]; then
+    cat > "$ACCOUNTS_DIR/$n/config.toml" << 'OAUTH_CFG'
+default_model = "kimi-code/kimi-for-coding"
+default_thinking = true
+default_yolo = false
+
+[models."kimi-code/kimi-for-coding"]
+provider = "managed:kimi-code"
+model = "kimi-for-coding"
+max_context_size = 262144
+capabilities = ["thinking", "image_in", "video_in"]
+
+[providers."managed:kimi-code"]
+type = "kimi"
+base_url = "https://api.kimi.com/coding/v1"
+api_key = ""
+
+[providers."managed:kimi-code".oauth]
+storage = "file"
+key = "oauth/kimi-code"
+
+[loop_control]
+max_steps_per_turn = 100
+max_retries_per_step = 3
+max_ralph_iterations = 0
+reserved_context_size = 50000
+
+[services.moonshot_search]
+base_url = "https://api.kimi.com/coding/v1/search"
+api_key = ""
+
+[services.moonshot_search.oauth]
+storage = "file"
+key = "oauth/kimi-code"
+
+[services.moonshot_fetch]
+base_url = "https://api.kimi.com/coding/v1/fetch"
+api_key = ""
+
+[services.moonshot_fetch.oauth]
+storage = "file"
+key = "oauth/kimi-code"
+
+[mcp.client]
+tool_call_timeout_ms = 60000
+OAUTH_CFG
+  fi
+
+  echo "  Open the URL below in your browser and log in."
+  echo ""
+  KIMI_SHARE_DIR="$ACCOUNTS_DIR/$n" "$KIMI_BIN" login
+  local exit_code=$?
+
+  if [ $exit_code -eq 0 ] && [ -f "$ACCOUNTS_DIR/$n/credentials/kimi-code.json" ]; then
+    echo ""
+    echo "  Account $n logged in successfully."
+    echo "  Run: kimi-account $n"
+  else
+    echo ""
+    echo "  Login may have failed. Try again: kimi-account login $n"
+  fi
+}
+
+# ── setup: bulk-add keys ──
+cmd_setup() {
+  echo "  Paste API keys, one per line. Press Ctrl+D when done."
+  echo "  (Lines that don't start with sk- are skipped)"
+  echo ""
+
+  local count=0
+  while IFS= read -r line; do
+    line=$(echo "$line" | xargs)  # trim whitespace
+    [ -z "$line" ] && continue
+    [[ ! "$line" == sk-* ]] && continue
+    cmd_add "$line"
+    count=$((count + 1))
+  done
+
+  echo ""
+  echo "  Added $count accounts. Total: $(ls -d "$ACCOUNTS_DIR"/*/ 2>/dev/null | wc -l)"
+}
+
+# ── list: show all accounts ──
+cmd_list() {
+  echo ""
+  echo "  Kimi Accounts ($ACCOUNTS_DIR)"
+  echo "  ───────────────────────────────────────"
+
+  if [ ! -d "$ACCOUNTS_DIR" ] || [ -z "$(ls -A "$ACCOUNTS_DIR" 2>/dev/null)" ]; then
+    echo "  (none — run 'kimi-account add <key>' to add)"
+    echo ""
+    return
+  fi
+
+  for d in "$ACCOUNTS_DIR"/*/; do
+    [ ! -d "$d" ] && continue
+    local name
+    name=$(basename "$d")
+    local auth="?"
+    local key_preview=""
+
+    if grep -q 'api_key = "sk-' "$d/config.toml" 2>/dev/null; then
+      auth="API key"
+      key_preview=$(grep 'api_key' "$d/config.toml" 2>/dev/null | head -1 | grep -o 'sk-[^"]*' | head -1)
+      key_preview="...${key_preview: -8}"
+    elif [ -f "$d/credentials/kimi-code.json" ]; then
+      auth="OAuth"
+      key_preview="(browser login)"
+    else
+      auth="—"
+      key_preview="not configured"
+    fi
+
+    printf "  %-4s  %-8s  %s\n" "$name" "$auth" "$key_preview"
+  done
+  echo ""
+  echo "  Run:  kimi-account <number> [args...]"
+  echo ""
+}
+
+# ── check: test all accounts ──
+cmd_check() {
+  echo ""
+  echo "  Testing all accounts..."
+  echo ""
+
+  for d in "$ACCOUNTS_DIR"/*/; do
+    [ ! -d "$d" ] && continue
+    local name
+    name=$(basename "$d")
+    printf "  %-4s  " "$name"
+
+    local result
+    result=$(KIMI_SHARE_DIR="$d" timeout 20 "$KIMI_BIN" -c "Say just the word 'ok'" --quiet 2>/dev/null || echo "FAILED")
+
+    if echo "$result" | grep -qi "ok\|yes\|hello\|sure\|certainly"; then
+      echo "WORKING"
+    elif echo "$result" | grep -qi "rate.limit\|429\|quota\|exceeded"; then
+      echo "RATE LIMITED"
+    elif echo "$result" | grep -qi "auth\|unauthorized\|invalid.*key\|401\|403"; then
+      echo "BAD KEY"
+    elif [ "$result" = "FAILED" ] || [ -z "$result" ]; then
+      echo "NO RESPONSE"
+    else
+      echo "WORKING"
+    fi
+  done
+  echo ""
+}
+
+# ── run: launch kimi with account ──
+cmd_run() {
+  local acct="$1"
+  shift
+  local share_dir="$ACCOUNTS_DIR/$acct"
+
+  if [ ! -d "$share_dir" ]; then
+    echo "  Account '$acct' not found."
+    echo "  Run 'kimi-account list' to see available accounts."
+    exit 1
+  fi
+
+  exec env KIMI_SHARE_DIR="$share_dir" "$KIMI_BIN" "$@"
+}
+
+# ── opencode: launch opencode with account ──
+cmd_opencode() {
+  local acct="$1"
+  shift
+  local share_dir="$ACCOUNTS_DIR/$acct"
+
+  if [ ! -d "$share_dir" ]; then
+    echo "  Account '$acct' not found."
+    exit 1
+  fi
+
+  exec env KIMI_SHARE_DIR="$share_dir" "$OPENCODE_BIN" "$@"
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+mkdir -p "$ACCOUNTS_DIR"
+
+if [ $# -eq 0 ]; then
+  usage
+  exit 0
+fi
+
+case "$1" in
+  -h|--help|help)
+    usage ;;
+  add)
+    [ $# -lt 2 ] && echo "  Usage: kimi-account add <api-key>" && exit 1
+    cmd_add "$2" ;;
+  setup)
+    cmd_setup ;;
+  list|ls)
+    cmd_list ;;
+  check|test)
+    cmd_check ;;
+  login)
+    shift
+    cmd_login "$@" ;;
+  opencode|oc)
+    [ $# -lt 2 ] && echo "  Usage: kimi-account opencode <number>" && exit 1
+    shift
+    cmd_opencode "$@" ;;
+  [0-9]*)
+    cmd_run "$@" ;;
+  *)
+    # Try as account name
+    if [ -d "$ACCOUNTS_DIR/$1" ]; then
+      cmd_run "$@"
+    else
+      echo "  Unknown command: $1"
+      usage
+      exit 1
+    fi ;;
+esac

@@ -1,0 +1,621 @@
+#!/bin/bash
+# ais — AI coding agent session manager
+#
+# Create, monitor, and control Claude Code / Kimi Code sessions in tmux.
+#
+# Usage:
+#   ais create <name> -a claude|kimi -A <account> [-c "cmd"] [--yolo]
+#   ais ls                          List all managed sessions
+#   ais inspect <name> [-n lines]   Capture current output
+#   ais inject <name> "text"        Send text into session
+#   ais watch <name> [-i secs]      Live-monitor session
+#   ais logs <name> [-o file]       Save scrollback to file
+#   ais kill <name|--all>           Graceful shutdown
+#   ais accounts                    List available accounts
+
+set -uo pipefail
+
+# ═══════════════════════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════════════════════
+VERSION="1.0.0"
+CLAUDE_BIN=~/.local/bin/claude
+KIMI_BIN=~/.local/bin/kimi
+CLAUDE_ACCOUNTS_DIR=~/.claude-accounts
+KIMI_ACCOUNTS_DIR=~/.kimi-accounts
+DEFAULT_WIDTH=160
+DEFAULT_HEIGHT=50
+CLAUDE_LOAD_TIME=14
+KIMI_LOAD_TIME=8
+RATE_LIMIT_PATTERN='rate.?limit|429|overloaded|quota.?exceeded|too many requests|credit balance is too low|insufficient_quota|hit your limit'
+
+# ═══════════════════════════════════════════════════════════════════════
+# Utilities
+# ═══════════════════════════════════════════════════════════════════════
+die()  { echo "ais: error: $*" >&2; exit 1; }
+warn() { echo "ais: warning: $*" >&2; }
+info() { echo "ais: $*"; }
+
+sanitize_utf8() {
+  LC_ALL=C sed 's/[^[:print:][:space:]]//g' | iconv -f utf-8 -t utf-8 -c 2>/dev/null || cat
+}
+
+session_exists() {
+  tmux has-session -t "$1" 2>/dev/null
+}
+
+is_managed() {
+  local val
+  val=$(tmux show-environment -t "$1" AIS_MANAGED 2>/dev/null)
+  [[ "$val" == "AIS_MANAGED=1" ]]
+}
+
+get_meta() {
+  local session="$1" key="$2"
+  local val
+  val=$(tmux show-environment -t "$session" "$key" 2>/dev/null)
+  echo "${val#*=}"
+}
+
+require_session() {
+  local name="$1"
+  session_exists "$name" || die "session '$name' not found (run 'ais ls' to see sessions)"
+}
+
+validate_name() {
+  local name="$1"
+  [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || die "invalid session name: '$name' (use letters, numbers, hyphens, underscores)"
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# usage
+# ═══════════════════════════════════════════════════════════════════════
+usage() {
+  cat << 'EOF'
+ais — AI coding agent session manager
+
+Usage:
+  ais create <name> [options]       Create a new agent session
+  ais ls                            List all managed sessions
+  ais inspect <name> [options]      Capture current output
+  ais inject <name> <text>          Send text into a session
+  ais watch <name> [options]        Live-monitor a session
+  ais logs <name> [options]         Save scrollback to file
+  ais kill <name|--all> [options]   Shut down a session
+  ais accounts                      List available accounts
+
+Create options:
+  -a, --agent TYPE      Agent: claude, kimi (default: kimi)
+  -A, --account ID      Account: cc1..nicxxx for claude, 1..N for kimi
+  -c, --cmd TEXT        Command to inject after agent loads
+  -d, --dir PATH        Working directory (default: current)
+  --yolo                Auto-approve mode
+  --attach              Attach to session after creation
+  --size WxH            Terminal size (default: 160x50)
+  --                    Pass remaining flags to agent CLI
+
+Inspect options:
+  -n, --lines N         Lines to capture (default: 50)
+  --rate-limit          Check for rate limit patterns
+
+Inject options:
+  --no-enter            Send text without pressing Enter
+
+Watch options:
+  -n, --lines N         Lines per refresh (default: 30)
+  -i, --interval SECS   Refresh interval (default: 2)
+  --until PATTERN       Exit when pattern appears
+
+Kill options:
+  --all                 Kill all managed sessions
+  --force               Skip graceful shutdown
+  --save                Save scrollback before killing
+
+Examples:
+  ais create worker1 -a claude -A cc1 -c "fix the auth bug"
+  ais create kimi-task -a kimi -A 2 --yolo
+  ais inspect worker1 -n 200
+  ais inject worker1 "run the tests"
+  ais watch worker1 -i 5
+  ais kill worker1
+  ais kill --all
+EOF
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# cmd_create
+# ═══════════════════════════════════════════════════════════════════════
+cmd_create() {
+  local name="" agent="kimi" account="" cmd="" dir="" yolo=false attach=false
+  local width=$DEFAULT_WIDTH height=$DEFAULT_HEIGHT
+  local extra_args=()
+  local parsing_extra=false
+
+  while [[ $# -gt 0 ]]; do
+    if [[ "$parsing_extra" == true ]]; then
+      extra_args+=("$1"); shift; continue
+    fi
+    case "$1" in
+      -a|--agent)   agent="$2"; shift 2 ;;
+      -A|--account) account="$2"; shift 2 ;;
+      -c|--cmd)     cmd="$2"; shift 2 ;;
+      -d|--dir)     dir="$2"; shift 2 ;;
+      --yolo)       yolo=true; shift ;;
+      --attach)     attach=true; shift ;;
+      --size)       width="${2%%x*}"; height="${2##*x}"; shift 2 ;;
+      --)           parsing_extra=true; shift ;;
+      -*)           die "unknown option: $1" ;;
+      *)
+        if [[ -z "$name" ]]; then
+          name="$1"; shift
+        else
+          die "unexpected argument: $1"
+        fi
+        ;;
+    esac
+  done
+
+  [[ -z "$name" ]] && die "session name required (ais create <name> ...)"
+  validate_name "$name"
+  session_exists "$name" && die "session '$name' already exists (use 'ais kill $name' first)"
+
+  # Resolve agent binary and account env var
+  local env_var="" config_dir="" binary="" load_time=0
+
+  case "$agent" in
+    claude)
+      binary="$CLAUDE_BIN"
+      env_var="CLAUDE_CONFIG_DIR"
+      [[ -z "$account" ]] && die "account required for claude (-A cc1, cc2, cc3, hataricc, nicxxx)"
+      config_dir="$CLAUDE_ACCOUNTS_DIR/$account"
+      [[ -d "$config_dir" ]] || die "claude account '$account' not found at $config_dir"
+      load_time=$CLAUDE_LOAD_TIME
+      [[ "$yolo" == true ]] && extra_args=("--dangerously-skip-permissions" "${extra_args[@]}")
+      ;;
+    kimi)
+      binary="$KIMI_BIN"
+      env_var="KIMI_SHARE_DIR"
+      [[ -z "$account" ]] && die "account required for kimi (-A 1, 2, ...)"
+      config_dir="$KIMI_ACCOUNTS_DIR/$account"
+      [[ -d "$config_dir" ]] || die "kimi account '$account' not found at $config_dir"
+      load_time=$KIMI_LOAD_TIME
+      [[ "$yolo" == true ]] && extra_args=("--yolo" "${extra_args[@]}")
+      ;;
+    *)
+      die "unknown agent: $agent (use 'claude' or 'kimi')"
+      ;;
+  esac
+
+  [[ ! -x "$binary" ]] && [[ ! -f "$binary" ]] && die "agent binary not found: $binary"
+
+  # Build launch command
+  local launch_cmd="${env_var}='${config_dir}' '${binary}'"
+  for arg in "${extra_args[@]}"; do
+    launch_cmd+=" '$arg'"
+  done
+
+  # Working directory
+  local tmux_dir_args=()
+  if [[ -n "$dir" ]]; then
+    [[ -d "$dir" ]] || die "directory not found: $dir"
+    tmux_dir_args=(-c "$dir")
+  fi
+
+  # Create tmux session
+  tmux new-session -d -s "$name" -x "$width" -y "$height" "${tmux_dir_args[@]}"
+
+  # Set metadata
+  tmux set-environment -t "$name" AIS_MANAGED 1
+  tmux set-environment -t "$name" AIS_AGENT "$agent"
+  tmux set-environment -t "$name" AIS_ACCOUNT "$account"
+  tmux set-environment -t "$name" AIS_DIR "${dir:-$(pwd)}"
+  tmux set-environment -t "$name" AIS_CREATED "$(date +%s)"
+
+  # Launch agent
+  tmux send-keys -t "$name" "$launch_cmd" Enter
+
+  info "created '$name' ($agent / account $account)"
+
+  # Schedule command injection after load time
+  if [[ -n "$cmd" ]]; then
+    info "command will be injected in ~${load_time}s: $cmd"
+    (
+      sleep "$load_time"
+      if tmux has-session -t "$name" 2>/dev/null; then
+        tmux send-keys -t "$name" -l -- "$cmd"
+        sleep 0.2
+        tmux send-keys -t "$name" Enter
+      fi
+    ) &
+    disown
+  fi
+
+  info "attach: tmux attach -t $name"
+
+  if [[ "$attach" == true ]]; then
+    exec tmux attach-session -t "$name"
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# cmd_ls
+# ═══════════════════════════════════════════════════════════════════════
+cmd_ls() {
+  local show_all=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -a|--all) show_all=true; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  local sessions
+  sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null) || true
+
+  if [[ -z "$sessions" ]]; then
+    info "no tmux sessions running"
+    return
+  fi
+
+  printf "  %-20s %-8s %-10s %-30s %s\n" "NAME" "AGENT" "ACCOUNT" "DIR" "AGE"
+  printf "  %-20s %-8s %-10s %-30s %s\n" "────────────────────" "────────" "──────────" "──────────────────────────────" "────────"
+
+  local found=false
+  while IFS= read -r sess; do
+    local managed
+    managed=$(tmux show-environment -t "$sess" AIS_MANAGED 2>/dev/null || true)
+
+    if [[ "$managed" == "AIS_MANAGED=1" ]]; then
+      found=true
+      local agent account dir created age_str
+      agent=$(get_meta "$sess" AIS_AGENT)
+      account=$(get_meta "$sess" AIS_ACCOUNT)
+      dir=$(get_meta "$sess" AIS_DIR)
+      created=$(get_meta "$sess" AIS_CREATED)
+
+      # Calculate age
+      age_str="?"
+      if [[ -n "$created" ]] && [[ "$created" =~ ^[0-9]+$ ]]; then
+        local now elapsed
+        now=$(date +%s)
+        elapsed=$((now - created))
+        if [[ $elapsed -lt 60 ]]; then
+          age_str="${elapsed}s"
+        elif [[ $elapsed -lt 3600 ]]; then
+          age_str="$((elapsed / 60))m"
+        else
+          age_str="$((elapsed / 3600))h$((elapsed % 3600 / 60))m"
+        fi
+      fi
+
+      # Shorten dir for display
+      local short_dir="${dir/#$HOME/\~}"
+      [[ ${#short_dir} -gt 30 ]] && short_dir="...${short_dir: -27}"
+
+      printf "  %-20s %-8s %-10s %-30s %s\n" "$sess" "$agent" "$account" "$short_dir" "$age_str"
+
+    elif [[ "$show_all" == true ]]; then
+      printf "  %-20s %-8s %-10s %-30s %s\n" "$sess" "-" "-" "-" "-"
+    fi
+  done <<< "$sessions"
+
+  if [[ "$found" == false ]] && [[ "$show_all" == false ]]; then
+    info "no managed sessions (use 'ais ls -a' to show all tmux sessions)"
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# cmd_inspect
+# ═══════════════════════════════════════════════════════════════════════
+cmd_inspect() {
+  local name="" lines=50 check_rate_limit=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--lines) lines="$2"; shift 2 ;;
+      --rate-limit) check_rate_limit=true; shift ;;
+      -*)  die "unknown option: $1" ;;
+      *)
+        if [[ -z "$name" ]]; then
+          name="$1"; shift
+        else
+          die "unexpected argument: $1"
+        fi
+        ;;
+    esac
+  done
+
+  [[ -z "$name" ]] && die "session name required (ais inspect <name>)"
+  require_session "$name"
+
+  local output
+  output=$(tmux capture-pane -t "$name" -p -S "-${lines}" 2>/dev/null | sanitize_utf8)
+
+  if [[ -z "$output" ]]; then
+    info "session '$name' has no output"
+    return
+  fi
+
+  echo "$output"
+
+  if [[ "$check_rate_limit" == true ]]; then
+    if echo "$output" | grep -qiE "$RATE_LIMIT_PATTERN"; then
+      echo ""
+      echo "*** RATE LIMIT DETECTED ***"
+      echo ""
+      echo "$output" | grep -iE "$RATE_LIMIT_PATTERN"
+    fi
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# cmd_inject
+# ═══════════════════════════════════════════════════════════════════════
+cmd_inject() {
+  local name="" text="" no_enter=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-enter) no_enter=true; shift ;;
+      -*)  die "unknown option: $1" ;;
+      *)
+        if [[ -z "$name" ]]; then
+          name="$1"; shift
+        elif [[ -z "$text" ]]; then
+          text="$1"; shift
+        else
+          # Append remaining args as part of text
+          text="$text $1"; shift
+        fi
+        ;;
+    esac
+  done
+
+  [[ -z "$name" ]] && die "session name required (ais inject <name> \"text\")"
+  [[ -z "$text" ]] && die "text required (ais inject <name> \"text\")"
+  require_session "$name"
+
+  tmux send-keys -t "$name" -l -- "$text"
+  if [[ "$no_enter" == false ]]; then
+    sleep 0.1
+    tmux send-keys -t "$name" Enter
+  fi
+
+  info "sent to '$name'"
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# cmd_watch
+# ═══════════════════════════════════════════════════════════════════════
+cmd_watch() {
+  local name="" lines=30 interval=2 until_pattern=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--lines)    lines="$2"; shift 2 ;;
+      -i|--interval) interval="$2"; shift 2 ;;
+      --until)       until_pattern="$2"; shift 2 ;;
+      -*)  die "unknown option: $1" ;;
+      *)
+        if [[ -z "$name" ]]; then
+          name="$1"; shift
+        else
+          die "unexpected argument: $1"
+        fi
+        ;;
+    esac
+  done
+
+  [[ -z "$name" ]] && die "session name required (ais watch <name>)"
+  require_session "$name"
+
+  local agent account
+  agent=$(get_meta "$name" AIS_AGENT)
+  account=$(get_meta "$name" AIS_ACCOUNT)
+
+  trap 'echo ""; info "stopped watching"; exit 0' INT
+
+  while true; do
+    if ! session_exists "$name"; then
+      echo ""
+      info "session '$name' has ended"
+      break
+    fi
+
+    clear
+    printf "=== ais watch: %s | %s/%s | %s | Ctrl-C to stop ===\n\n" \
+      "$name" "${agent:-?}" "${account:-?}" "$(date +%H:%M:%S)"
+
+    local output
+    output=$(tmux capture-pane -t "$name" -p -S "-${lines}" 2>/dev/null | sanitize_utf8)
+    echo "$output"
+
+    # Rate limit check
+    if echo "$output" | grep -qiE "$RATE_LIMIT_PATTERN"; then
+      echo ""
+      echo "*** RATE LIMIT DETECTED ***"
+    fi
+
+    # Until pattern check
+    if [[ -n "$until_pattern" ]]; then
+      if echo "$output" | grep -qiE "$until_pattern"; then
+        echo ""
+        info "pattern matched: $until_pattern"
+        break
+      fi
+    fi
+
+    sleep "$interval"
+  done
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# cmd_logs
+# ═══════════════════════════════════════════════════════════════════════
+cmd_logs() {
+  local name="" output_file=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|--output) output_file="$2"; shift 2 ;;
+      -*)  die "unknown option: $1" ;;
+      *)
+        if [[ -z "$name" ]]; then
+          name="$1"; shift
+        else
+          die "unexpected argument: $1"
+        fi
+        ;;
+    esac
+  done
+
+  [[ -z "$name" ]] && die "session name required (ais logs <name>)"
+  require_session "$name"
+
+  [[ -z "$output_file" ]] && output_file="${name}-$(date +%Y%m%d-%H%M%S).log"
+
+  # Capture entire scrollback (-S - means from the very beginning)
+  tmux capture-pane -t "$name" -p -S - 2>/dev/null | sanitize_utf8 > "$output_file"
+
+  local line_count
+  line_count=$(wc -l < "$output_file")
+  info "saved $line_count lines to $output_file"
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# cmd_kill
+# ═══════════════════════════════════════════════════════════════════════
+cmd_kill() {
+  local name="" kill_all=false force=false save=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all)   kill_all=true; shift ;;
+      --force) force=true; shift ;;
+      --save)  save=true; shift ;;
+      -*)  die "unknown option: $1" ;;
+      *)
+        if [[ -z "$name" ]]; then
+          name="$1"; shift
+        else
+          die "unexpected argument: $1"
+        fi
+        ;;
+    esac
+  done
+
+  if [[ "$kill_all" == true ]]; then
+    local sessions
+    sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null) || true
+    [[ -z "$sessions" ]] && { info "no sessions to kill"; return; }
+
+    while IFS= read -r sess; do
+      is_managed "$sess" || continue
+      kill_one "$sess" "$force" "$save"
+    done <<< "$sessions"
+    return
+  fi
+
+  [[ -z "$name" ]] && die "session name required (ais kill <name> or ais kill --all)"
+  require_session "$name"
+  kill_one "$name" "$force" "$save"
+}
+
+kill_one() {
+  local name="$1" force="$2" save="$3"
+
+  if [[ "$save" == true ]]; then
+    local logfile="${name}-$(date +%Y%m%d-%H%M%S).log"
+    tmux capture-pane -t "$name" -p -S - 2>/dev/null | sanitize_utf8 > "$logfile"
+    info "saved scrollback to $logfile"
+  fi
+
+  if [[ "$force" == true ]]; then
+    tmux kill-session -t "$name" 2>/dev/null || true
+    info "killed '$name' (forced)"
+    return
+  fi
+
+  # Graceful: send /exit
+  tmux send-keys -t "$name" -l -- "/exit"
+  sleep 0.1
+  tmux send-keys -t "$name" Enter
+
+  # Wait up to 10 seconds
+  local i
+  for i in $(seq 1 10); do
+    session_exists "$name" || { info "killed '$name' (graceful)"; return; }
+    sleep 1
+  done
+
+  # Force kill
+  warn "'$name' did not exit gracefully, force killing"
+  tmux kill-session -t "$name" 2>/dev/null || true
+  info "killed '$name'"
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# cmd_accounts
+# ═══════════════════════════════════════════════════════════════════════
+cmd_accounts() {
+  echo ""
+  echo "  Claude Code accounts ($CLAUDE_ACCOUNTS_DIR)"
+  echo "  ─────────────────────────────────────"
+  if [[ -d "$CLAUDE_ACCOUNTS_DIR" ]]; then
+    for d in "$CLAUDE_ACCOUNTS_DIR"/*/; do
+      [[ ! -d "$d" ]] && continue
+      local name
+      name=$(basename "$d")
+      printf "    %-12s" "$name"
+      if [[ -f "$d/credentials.json" ]]; then
+        echo "  (logged in)"
+      elif [[ -f "$d/settings.json" ]]; then
+        echo "  (configured)"
+      else
+        echo "  (empty)"
+      fi
+    done
+  else
+    echo "    (none)"
+  fi
+
+  echo ""
+  echo "  Kimi Code accounts ($KIMI_ACCOUNTS_DIR)"
+  echo "  ─────────────────────────────────────"
+  if [[ -d "$KIMI_ACCOUNTS_DIR" ]]; then
+    for d in "$KIMI_ACCOUNTS_DIR"/*/; do
+      [[ ! -d "$d" ]] && continue
+      local name
+      name=$(basename "$d")
+      printf "    %-12s" "$name"
+      if grep -q 'api_key = "sk-' "$d/config.toml" 2>/dev/null; then
+        echo "  (API key)"
+      elif [[ -f "$d/credentials/kimi-code.json" ]]; then
+        echo "  (OAuth)"
+      else
+        echo "  (not configured)"
+      fi
+    done
+  else
+    echo "    (none)"
+  fi
+  echo ""
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main dispatch
+# ═══════════════════════════════════════════════════════════════════════
+case "${1:-help}" in
+  create)             shift; cmd_create "$@" ;;
+  ls|list)            shift; cmd_ls "$@" ;;
+  inspect|cap|capture) shift; cmd_inspect "$@" ;;
+  inject|send)        shift; cmd_inject "$@" ;;
+  watch)              shift; cmd_watch "$@" ;;
+  logs)               shift; cmd_logs "$@" ;;
+  kill)               shift; cmd_kill "$@" ;;
+  accounts|acct)      shift; cmd_accounts "$@" ;;
+  -h|--help|help)     usage ;;
+  -v|--version)       echo "ais $VERSION" ;;
+  *)                  die "unknown command: $1 (try 'ais help')" ;;
+esac
