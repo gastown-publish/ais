@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2001,SC2034
 # check-credit.sh — Check Claude Code credit usage for all accounts
 # Launches a temp Claude Code session per account, runs /usage, parses output
 # Times displayed in GMT+7 (Bangkok)
