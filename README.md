@@ -35,16 +35,44 @@ Most multi-agent tools give you a dashboard. `ais` gives you a **scriptable CLI*
 
 ## Quick Start
 
-```bash
-# Install
-git clone https://github.com/gastown-publish/ais.git
-export PATH="$PWD/ais/bin:$PATH"
+### Install
 
+```bash
+# Option A: Clone and add to PATH
+git clone https://github.com/gastown-publish/ais.git
+cp ais/bin/ais ~/.local/bin/ais
+chmod +x ~/.local/bin/ais
+
+# Option B: Direct download
+curl -sL https://raw.githubusercontent.com/gastown-publish/ais/main/bin/ais \
+  -o ~/.local/bin/ais && chmod +x ~/.local/bin/ais
+```
+
+Make sure `~/.local/bin` is in your PATH.
+
+### Set up an account
+
+```bash
+# Claude Code
+mkdir -p ~/.claude-accounts/cc1
+CLAUDE_CONFIG_DIR=~/.claude-accounts/cc1 claude auth login
+
+# Kimi Code (free)
+mkdir -p ~/.kimi-accounts/kimi1
+KIMI_SHARE_DIR=~/.kimi-accounts/kimi1 kimi login
+```
+
+### Run your first agent
+
+```bash
 # See your accounts
 ais accounts
 
 # Launch an agent
-ais create worker1 -a claude -A cc1 -c "fix the auth bug"
+ais create worker1 -a claude -A cc1 --yolo -c "fix the auth bug"
+
+# Check progress
+ais inspect worker1 -n 20
 
 # Watch it work
 ais watch worker1
@@ -181,9 +209,37 @@ ais inject <name> "run tests"   # Send command to session
 ais watch <name> -i 5           # Watch live, refresh every 5s
 ais watch <name> --until "done" # Watch until pattern appears
 ais logs <name>                 # Save full scrollback to file
+ais status <name>               # Machine-readable status + log trail
 ais kill <name>                 # Graceful shutdown
 ais kill <name> --save          # Save logs, then kill
 ais kill --all --force          # Force kill everything
+```
+
+### Log trail & agent follow-up
+
+Every session creates a log trail at `~/.ais/logs/<session>/`:
+
+```
+~/.ais/logs/worker1/
+├── events.log      # Timestamped event log
+├── snapshots.log   # TUI captures at each analysis step
+├── status.json     # Machine-readable status (for other agents)
+└── prompt.txt      # Original task prompt
+```
+
+Other agents can pick up where a session left off:
+
+```bash
+# Read the original prompt
+cat ~/.ais/logs/worker1/prompt.txt
+
+# Check machine-readable status
+ais status worker1
+# {"session":"worker1","status":"running","detail":"command injected","updated":"..."}
+
+# Resume or retry
+ais kill worker1
+ais create worker1 -a claude -A cc2 -d ~/app -c "$(cat ~/.ais/logs/worker1/prompt.txt)"
 ```
 
 ---
@@ -204,19 +260,56 @@ ais kill --all --force          # Force kill everything
 
 ## Account Setup
 
-### Claude Code
+Each agent account gets its own isolated directory with separate credentials, so you can run multiple agents simultaneously without conflicts.
 
-Each account lives in `~/.claude-accounts/<name>/` (e.g., `cc1`, `cc2`). Each directory contains a separate Claude Code configuration with its own credentials.
-
-See [`docs/agent-setup.md`](docs/agent-setup.md) for detailed setup instructions.
-
-### Kimi Code
-
-Accounts live in `~/.kimi-accounts/<n>/`. Use the `kimi-account` tool to manage them:
+### Claude Code (quick setup)
 
 ```bash
-kimi-account --help
+# 1. Create account directory
+mkdir -p ~/.claude-accounts/cc1
+
+# 2. Log in (opens browser, paste code back)
+CLAUDE_CONFIG_DIR=~/.claude-accounts/cc1 claude auth login
+
+# 3. Auto-approve permissions (ais does this automatically, but you can do it manually)
+cat > ~/.claude-accounts/cc1/settings.json << 'EOF'
+{
+  "permissions": {
+    "allow": ["Bash(*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "WebFetch(*)", "WebSearch(*)"],
+    "deny": []
+  }
+}
+EOF
 ```
+
+**Running as root?** Prefix with `IS_SANDBOX=1`. **Inside another Claude session?** Add `CLAUDECODE=`.
+
+Repeat for each account (`cc2`, `cc3`, etc.) — each needs its own separate OAuth login.
+
+### Kimi Code (quick setup)
+
+```bash
+# Option A: OAuth (free)
+mkdir -p ~/.kimi-accounts/kimi1
+KIMI_SHARE_DIR=~/.kimi-accounts/kimi1 kimi login
+
+# Option B: API key (from platform.kimi.com)
+mkdir -p ~/.kimi-accounts/kimi1
+cat > ~/.kimi-accounts/kimi1/config.toml << EOF
+[providers."managed:kimi-code"]
+type = "kimi"
+base_url = "https://api.kimi.com/coding/v1"
+api_key = "sk-YOUR-KEY"
+EOF
+```
+
+### Verify
+
+```bash
+ais accounts    # Should list all configured accounts
+```
+
+See [`docs/account-setup.md`](docs/account-setup.md) for detailed instructions, container setup, and troubleshooting.
 
 ---
 
